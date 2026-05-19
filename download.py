@@ -27,6 +27,16 @@ INTERVAL_SECS = 3   # サーバー負荷配慮のリクエスト間隔
 TIMEOUT_SECS = 30
 OUT_DIR = Path("data/lzh")
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer": "http://www1.mbrace.or.jp/",
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+}
+
 
 def build_url(file_type: str, date: datetime) -> str:
     yyyymm = date.strftime("%Y%m")
@@ -41,7 +51,7 @@ def download_file(url: str, dest: Path) -> bool:
         return True
 
     try:
-        resp = requests.get(url, timeout=TIMEOUT_SECS)
+        resp = requests.get(url, timeout=TIMEOUT_SECS, headers=HEADERS)
         if resp.status_code == 200:
             dest.write_bytes(resp.content)
             print(f"  [OK]   {dest.name} ({len(resp.content):,} bytes)")

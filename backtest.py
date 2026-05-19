@@ -350,7 +350,7 @@ def show_course_stats(df_results: pd.DataFrame):
     print("-" * 40)
     for course, row in tbl.iterrows():
         bar = "█" * int(row["win_rate"] / 2)
-        print(f"  {int(course)}    {row['starts']:5.0f}  {row['wins']:5d}  {row['win_rate']:5.1f}%  {bar}")
+        print(f"  {int(course)}    {row['starts']:5.0f}  {int(row['wins']):5d}  {row['win_rate']:5.1f}%  {bar}")
     print()
 
 
@@ -433,7 +433,7 @@ def main():
         (f"直近{history_n}走 3着内率", f"× {W_RECENT_3RD}", "K ファイル蓄積"),
     ]
     for name, weight, src in feats:
-        used = "✓" if src == "常時" or (src == "B ファイル" and has_entries) else "─"
+        used = "✓" if src in ("常時", "K ファイル蓄積") or (src == "B ファイル" and has_entries) else "─"
         print(f"  {used}  {name:<20}  {weight:<8}  ({src})")
     print()
 

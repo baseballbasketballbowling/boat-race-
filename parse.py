@@ -389,6 +389,9 @@ def init_db(conn: sqlite3.Connection):
 
 
 def extract_lzh(lzh_path: Path) -> list[tuple[str, bytes]]:
+    # .txt はそのまま読み込み (テストデータ対応)
+    if lzh_path.suffix == ".txt":
+        return [(lzh_path.stem, lzh_path.read_bytes())]
     try:
         lhf = lhafile.Lhafile(str(lzh_path))
         return [(name, lhf.read(name)) for name in lhf.namelist()]
@@ -410,8 +413,15 @@ def parse_all(lzh_dir: Path, db_path: Path, debug: bool = False):
     conn = sqlite3.connect(db_path)
     init_db(conn)
 
-    k_files = sorted(lzh_dir.glob("k*.lzh"))
-    b_files = {p.stem[1:]: p for p in lzh_dir.glob("b*.lzh")}
+    k_files = sorted(
+        p for p in lzh_dir.iterdir()
+        if p.stem.startswith("k") and p.suffix in (".lzh", ".txt")
+    )
+    b_files = {
+        p.stem[1:]: p
+        for p in lzh_dir.iterdir()
+        if p.stem.startswith("b") and p.suffix in (".lzh", ".txt")
+    }
 
     if not k_files:
         print(f"K ファイルが見つかりません: {lzh_dir}/k*.lzh")
