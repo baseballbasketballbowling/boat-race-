@@ -1,25 +1,39 @@
 #!/usr/bin/env python3
 """
-BOAT RACE バックテスト シミュレーター
+BOAT RACE バックテスト — 複合スコアリングモデル
 
-コース別1着率をベースにした単純戦略で損益を試算します。
+選手能力・モーター成績・スタートタイミング・直近フォーム・コース適性を
+加重合算したスコアで出走艇をランク付けし、複数の賭け戦略を比較します。
 
 Usage:
-    python backtest.py [--bet AMOUNT] [DB_PATH]
+    python backtest.py [--bet AMOUNT] [--history N] [DB_PATH]
 
-    --bet AMOUNT : 1レースあたりの賭け金 (円, 省略時: 100)
-    DB_PATH      : SQLite DB ファイル (省略時: data/boatrace.db)
+    --bet AMOUNT  : 1点あたり賭け金 (円, 省略時: 100)
+    --history N   : 直近フォーム参照レース数 (省略時: 30)
 
-戦略一覧:
-    1. コース1 単勝 全賭け (最も基本的な戦略)
-    2. コース2 単勝 全賭け (比較用)
-    3. コース別 全1着率ランキング表示
-    4. コース勝率上位コース × 拡連複 (払戻データあり時)
+スコア構成要素 (B ファイルデータがある場合フル活用):
+    当地勝率      × 3.0   -- 最重要: その場での実績
+    全国勝率      × 2.0   -- 選手の総合力
+    モーター偏差  × 1.5   -- 2連率を基準50%からの偏差で評価
+    コース係数    × 1.5   -- 内コース有利の補正
+    平均ST        × -12   -- 低いほど踏み込める (フライングリスク考慮)
+    F回数ペナルティ× -3   -- フライング歴
+    直近1着率     × 2.5   -- 直近N走の調子 (ルックアヘッドなし)
+    直近3着内率   × 0.8   -- 安定性
+
+賭け戦略:
+    S1  単勝         : スコア1位に単勝
+    S2  3連複        : 上位3艇で3連複 (1点)
+    S3  3連単BOX     : 上位3艇で3連単BOX (6点)
+    S4  2連単流し    : 1位を1着固定, 2-3位を2着流し (2点)
+    S5  単勝バリュー : スコア1位 かつ 人気3位以下のみ賭け
 """
 
 import sys
 import sqlite3
+from collections import defaultdict
 from pathlib import Path
+from itertools import permutations
 
 try:
     import pandas as pd
@@ -27,143 +41,355 @@ except ImportError:
     sys.exit("ERROR: pandas がインストールされていません。  pip install pandas")
 
 DB_PATH = Path("data/boatrace.db")
-DEFAULT_BET = 100  # 円
+DEFAULT_BET = 100
+
+# ---------------------------------------------------------------------------
+# スコアリング定数
+# ---------------------------------------------------------------------------
+
+# コース係数 (全国平均1着率を正規化。コース1=1.00基準)
+COURSE_FACTOR = {1: 1.00, 2: 0.42, 3: 0.30, 4: 0.16, 5: 0.12, 6: 0.09}
+
+# 特徴量の重み
+W_VENUE_WR    = 3.0    # 当地勝率
+W_NAT_WR      = 2.0    # 全国勝率
+W_MOTOR       = 1.5    # モーター2連率偏差 (50%基準)
+W_COURSE      = 1.5    # コース係数
+W_AVG_ST      = -12.0  # 平均ST (秒)
+W_FL          = -3.0   # F回数
+W_RECENT_WIN  = 2.5    # 直近1着率
+W_RECENT_3RD  = 0.8    # 直近3着内率
+
+FALLBACK_AVG_START  = 0.18  # STデータなし時のデフォルト
+FALLBACK_MOTOR_2R   = 50.0  # モーターデータなし時
 
 
 # ---------------------------------------------------------------------------
-# データロード
+# メインエンジン
 # ---------------------------------------------------------------------------
 
-def load_results(conn: sqlite3.Connection) -> pd.DataFrame:
-    return pd.read_sql(
-        """
-        SELECT
-            r.date, r.venue_code, r.race_no,
-            res.race_id, res.boat_no,
-            res.course, res.racer_no, res.rank
-        FROM results res
-        JOIN races r ON r.id = res.race_id
-        WHERE res.course IS NOT NULL
-        ORDER BY r.date, r.venue_code, r.race_no, res.course
-        """,
-        conn,
-    )
+class BacktestEngine:
+    def __init__(self, bet_amount: int = DEFAULT_BET, history_n: int = 30):
+        self.bet = bet_amount
+        self.history_n = history_n
+        # racer_no → deque of (rank_or_None)  (直近結果, 時系列順)
+        self._racer_hist: dict[int, list] = defaultdict(list)
 
+    # ------------------------------------------------------------------
+    # データロード
+    # ------------------------------------------------------------------
 
-def load_payouts(conn: sqlite3.Connection, bet_type: str) -> pd.DataFrame:
-    return pd.read_sql(
-        "SELECT race_id, bet_type, combination, amount FROM payouts WHERE bet_type = ?",
-        conn,
-        params=(bet_type,),
-    )
-
-
-# ---------------------------------------------------------------------------
-# 統計表示
-# ---------------------------------------------------------------------------
-
-def show_course_stats(df: pd.DataFrame):
-    df_valid = df[df["rank"].notna()]
-    df_win   = df_valid[df_valid["rank"] == 1]
-
-    starts = df_valid.groupby("course").size().rename("starts")
-    wins   = df_win.groupby("course").size().rename("wins")
-    stats  = pd.concat([starts, wins], axis=1).fillna(0).astype({"wins": int})
-    stats["win_rate"] = stats["wins"] / stats["starts"] * 100
-    stats = stats.sort_index()
-
-    print("コース  出走数   1着数   1着率")
-    print("-" * 38)
-    for course, row in stats.iterrows():
-        bar = "█" * int(row["win_rate"] / 2)
-        print(
-            f"  {int(course)}    {row['starts']:5.0f}  {row['wins']:5d}  "
-            f"{row['win_rate']:5.1f}%  {bar}"
+    def load(self, conn: sqlite3.Connection):
+        """全データを日付順に読み込む。"""
+        self.df_races = pd.read_sql(
+            "SELECT id, date, venue_code, race_no FROM races ORDER BY date, venue_code, race_no",
+            conn,
         )
+        self.df_results = pd.read_sql(
+            "SELECT race_id, boat_no, course, racer_no, rank FROM results",
+            conn,
+        )
+        self.df_entries = pd.read_sql(
+            """SELECT race_id, boat_no, racer_no,
+                      avg_start, fl_count, late_count,
+                      national_winrate, national_2rate,
+                      venue_winrate,    venue_2rate,
+                      motor_2rate,      hull_2rate
+               FROM entries""",
+            conn,
+        )
+        self.df_payouts = pd.read_sql(
+            "SELECT race_id, bet_type, combination, amount, popularity FROM payouts",
+            conn,
+        )
+        self.has_entries = len(self.df_entries) > 0
+        self.has_payouts = len(self.df_payouts) > 0
+
+    # ------------------------------------------------------------------
+    # スコアリング
+    # ------------------------------------------------------------------
+
+    def _recent_stats(self, racer_no: int) -> tuple[float, float]:
+        """直近 history_n 走の (1着率, 3着内率)。データなし → (0, 0)。"""
+        hist = self._racer_hist.get(racer_no, [])
+        if not hist:
+            return 0.0, 0.0
+        recent = hist[-self.history_n:]
+        valid = [r for r in recent if r is not None]
+        if not valid:
+            return 0.0, 0.0
+        n = len(valid)
+        win_r  = sum(1 for r in valid if r == 1) / n
+        top3_r = sum(1 for r in valid if r <= 3) / n
+        return win_r, top3_r
+
+    def _score_one(self, boat_no: int, course: int | None,
+                   entry_row, racer_no: int | None) -> float:
+        """1艇のスコアを計算する。"""
+        score = 0.0
+        c = course or boat_no  # コース不明なら艇番をコース代用
+
+        # コース係数
+        score += COURSE_FACTOR.get(c, 0.08) * W_COURSE
+
+        if entry_row is not None:
+            e = entry_row
+
+            # 当地勝率
+            vwr = e.get("venue_winrate") or 0
+            score += vwr * W_VENUE_WR
+
+            # 全国勝率
+            nwr = e.get("national_winrate") or 0
+            score += nwr * W_NAT_WR
+
+            # モーター偏差
+            m2r = e.get("motor_2rate") or FALLBACK_MOTOR_2R
+            score += (m2r - FALLBACK_MOTOR_2R) / 10.0 * W_MOTOR
+
+            # 平均ST
+            avg_st = e.get("avg_start") or FALLBACK_AVG_START
+            score += avg_st * W_AVG_ST
+
+            # F回数ペナルティ
+            fl = e.get("fl_count") or 0
+            score += fl * W_FL
+
+        # 直近フォーム (ルックアヘッドなし — このレース前までの履歴のみ)
+        if racer_no:
+            win_r, top3_r = self._recent_stats(racer_no)
+            score += win_r  * W_RECENT_WIN
+            score += top3_r * W_RECENT_3RD
+
+        return score
+
+    def score_race(self, race_id: int) -> dict[int, float]:
+        """1レース全艇のスコア辞書 {boat_no: score} を返す。"""
+        results  = self.df_results[self.df_results["race_id"] == race_id]
+        entries  = self.df_entries[self.df_entries["race_id"] == race_id] if self.has_entries else pd.DataFrame()
+
+        entry_map: dict[int, dict] = {}
+        for _, row in entries.iterrows():
+            entry_map[int(row["boat_no"])] = row.to_dict()
+
+        scores = {}
+        for _, row in results.iterrows():
+            bn = int(row["boat_no"])
+            course = int(row["course"]) if pd.notna(row.get("course")) else None
+            racer_no = int(row["racer_no"]) if pd.notna(row.get("racer_no")) else None
+            entry_row = entry_map.get(bn)
+            scores[bn] = self._score_one(bn, course, entry_row, racer_no)
+
+        return scores
+
+    def _update_history(self, race_id: int):
+        """このレース結果を選手履歴に追記する (次以降のレースから参照)。"""
+        results = self.df_results[self.df_results["race_id"] == race_id]
+        for _, row in results.iterrows():
+            rn = row.get("racer_no")
+            if pd.notna(rn):
+                rank = int(row["rank"]) if pd.notna(row.get("rank")) else None
+                self._racer_hist[int(rn)].append(rank)
+
+    # ------------------------------------------------------------------
+    # 払戻ルックアップ
+    # ------------------------------------------------------------------
+
+    def _payout(self, race_id: int, bet_type: str, combo: str) -> int | None:
+        rows = self.df_payouts[
+            (self.df_payouts["race_id"] == race_id)
+            & (self.df_payouts["bet_type"] == bet_type)
+            & (self.df_payouts["combination"].str.strip() == combo.strip())
+        ]
+        return int(rows.iloc[0]["amount"]) if not rows.empty else None
+
+    def _popularity(self, race_id: int, bet_type: str, combo: str) -> int | None:
+        rows = self.df_payouts[
+            (self.df_payouts["race_id"] == race_id)
+            & (self.df_payouts["bet_type"] == bet_type)
+            & (self.df_payouts["combination"].str.strip() == combo.strip())
+        ]
+        return int(rows.iloc[0]["popularity"]) if not rows.empty else None
+
+    def _actual_result(self, race_id: int) -> dict[int, int]:
+        """{boat_no: rank}。着順なしは除外。"""
+        r = self.df_results[
+            self.df_results["race_id"] == race_id
+        ].dropna(subset=["rank"])
+        return {int(row["boat_no"]): int(row["rank"]) for _, row in r.iterrows()}
+
+    def _course_of(self, race_id: int, boat_no: int) -> int | None:
+        row = self.df_results[
+            (self.df_results["race_id"] == race_id)
+            & (self.df_results["boat_no"] == boat_no)
+        ]
+        if row.empty:
+            return None
+        c = row.iloc[0].get("course")
+        return int(c) if pd.notna(c) else None
+
+    # ------------------------------------------------------------------
+    # バックテスト実行
+    # ------------------------------------------------------------------
+
+    def run(self) -> dict[str, dict]:
+        """全レースを時系列順に処理し、各戦略の損益を集計する。"""
+        stats = {
+            "S1_単勝":         {"bets": 0, "returns": 0, "hits": 0, "races": 0},
+            "S2_3連複":        {"bets": 0, "returns": 0, "hits": 0, "races": 0},
+            "S3_3連単BOX":     {"bets": 0, "returns": 0, "hits": 0, "races": 0},
+            "S4_2連単流し":    {"bets": 0, "returns": 0, "hits": 0, "races": 0},
+            "S5_単勝バリュー": {"bets": 0, "returns": 0, "hits": 0, "races": 0},
+        }
+
+        for _, race in self.df_races.iterrows():
+            rid = int(race["id"])
+            scores = self.score_race(rid)
+            if len(scores) < 3:
+                self._update_history(rid)
+                continue
+
+            ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+            top1, top2, top3 = ranked[0][0], ranked[1][0], ranked[2][0]
+
+            actual = self._actual_result(rid)
+            if not actual:
+                self._update_history(rid)
+                continue
+
+            # コース番号に変換 (払戻のキーはコース番号)
+            def course(bn):
+                c = self._course_of(rid, bn)
+                return c or bn
+
+            c1, c2, c3 = course(top1), course(top2), course(top3)
+
+            def winner_course() -> int | None:
+                for bn, rk in actual.items():
+                    if rk == 1:
+                        return course(bn)
+                return None
+
+            def finishers_courses() -> list[int]:
+                ordered = sorted(actual.items(), key=lambda x: x[1])
+                return [course(bn) for bn, _ in ordered[:3]]
+
+            win_c = winner_course()
+            fin3  = finishers_courses()
+
+            # ── S1: スコア1位 単勝 ──────────────────────────────
+            s = stats["S1_単勝"]
+            s["races"] += 1
+            s["bets"]  += self.bet
+            if win_c == c1:
+                p = self._payout(rid, "単勝", str(c1)) or 110
+                s["returns"] += p; s["hits"] += 1
+
+            # ── S2: 上位3艇 3連複 (1点) ──────────────────────────
+            s = stats["S2_3連複"]
+            s["races"] += 1
+            s["bets"]  += self.bet
+            trio_key = "".join(sorted([str(c1), str(c2), str(c3)]))
+            if set(fin3) >= {c1, c2, c3}:
+                p = self._payout(rid, "3連複", trio_key) or 0
+                if p:
+                    s["returns"] += p; s["hits"] += 1
+
+            # ── S3: 上位3艇 3連単BOX (6点) ───────────────────────
+            s = stats["S3_3連単BOX"]
+            s["races"] += 1
+            s["bets"]  += self.bet * 6
+            if len(fin3) == 3:
+                combo_key = "".join(str(x) for x in fin3)
+                if set(fin3) == {c1, c2, c3}:
+                    p = self._payout(rid, "3連単", combo_key) or 0
+                    if p:
+                        s["returns"] += p; s["hits"] += 1
+
+            # ── S4: 1位固定 2連単流し (上位2・3位を2着、2点) ─────
+            s = stats["S4_2連単流し"]
+            s["races"] += 1
+            s["bets"]  += self.bet * 2
+            if len(fin3) >= 2:
+                actual_1st = fin3[0]
+                actual_2nd = fin3[1]
+                if actual_1st == c1 and actual_2nd in (c2, c3):
+                    key = f"{c1}{actual_2nd}"
+                    p = self._payout(rid, "2連単", key) or 0
+                    if p:
+                        s["returns"] += p; s["hits"] += 1
+
+            # ── S5: 単勝バリュー (1位 かつ 人気3位以下) ──────────
+            s = stats["S5_単勝バリュー"]
+            pop = self._popularity(rid, "単勝", str(c1))
+            if pop is None or pop >= 3:
+                s["races"] += 1
+                s["bets"]  += self.bet
+                if win_c == c1:
+                    p = self._payout(rid, "単勝", str(c1)) or 110
+                    s["returns"] += p; s["hits"] += 1
+
+            self._update_history(rid)
+
+        return stats
+
+
+# ---------------------------------------------------------------------------
+# 表示
+# ---------------------------------------------------------------------------
+
+def show_course_stats(df_results: pd.DataFrame):
+    valid = df_results.dropna(subset=["rank"])
+    wins  = valid[valid["rank"] == 1]
+    starts = valid.groupby("course").size().rename("starts")
+    w      = wins.groupby("course").size().rename("wins")
+    tbl    = pd.concat([starts, w], axis=1).fillna(0).astype({"wins": int}).sort_index()
+    tbl["win_rate"] = tbl["wins"] / tbl["starts"] * 100
+
+    print("コース  出走数  1着数   1着率")
+    print("-" * 40)
+    for course, row in tbl.iterrows():
+        bar = "█" * int(row["win_rate"] / 2)
+        print(f"  {int(course)}    {row['starts']:5.0f}  {row['wins']:5d}  {row['win_rate']:5.1f}%  {bar}")
     print()
-    return stats
+
+
+def show_results(stats: dict[str, dict], bet: int):
+    header = f"{'戦略':<16}  {'点数':>3}  {'レース':>6}  {'的中':>5}  " \
+             f"{'的中率':>6}  {'総賭金':>10}  {'総払戻':>10}  {'損益':>10}  {'回収率':>7}"
+    print(header)
+    print("-" * len(header))
+
+    for name, s in stats.items():
+        if s["races"] == 0:
+            continue
+        n_bets  = s["bets"] // bet  # 1レースあたりの点数
+        roi     = s["returns"] / s["bets"] * 100 if s["bets"] else 0
+        hit_r   = s["hits"] / s["races"] * 100 if s["races"] else 0
+        net     = s["returns"] - s["bets"]
+        label   = name.split("_", 1)[1]
+        print(
+            f"  {label:<14}  {n_bets:>3}  {s['races']:>6}  {s['hits']:>5}  "
+            f"{hit_r:>5.1f}%  ¥{s['bets']:>9,}  ¥{s['returns']:>9,}  "
+            f"¥{net:>+10,}  {roi:>6.1f}%"
+        )
 
 
 # ---------------------------------------------------------------------------
-# バックテスト共通
-# ---------------------------------------------------------------------------
-
-def run_backtest(
-    df: pd.DataFrame,
-    df_payouts: pd.DataFrame,
-    bet_course: int,
-    bet_amount: int,
-    bet_type: str = "単勝",
-    label: str = "",
-):
-    """指定コースへの単純全賭け戦略をシミュレートする。"""
-    races = (
-        df[["race_id", "date", "venue_code", "race_no"]]
-        .drop_duplicates("race_id")
-    )
-
-    total_bets    = 0
-    total_returns = 0
-    wins          = 0
-    no_payout_data = 0
-
-    for _, race in races.iterrows():
-        rid = race["race_id"]
-
-        # 対象コースの艇を探す
-        slot = df[(df["race_id"] == rid) & (df["course"] == bet_course)]
-        if slot.empty:
-            continue  # このレースに指定コース艇なし
-
-        rank = slot.iloc[0]["rank"]
-        total_bets += bet_amount
-
-        if pd.notna(rank) and int(rank) == 1:
-            # 勝ち → 払戻取得
-            prow = df_payouts[
-                (df_payouts["race_id"] == rid)
-                & (df_payouts["combination"].str.strip() == str(bet_course))
-            ]
-            if not prow.empty:
-                total_returns += int(prow.iloc[0]["amount"])
-                wins += 1
-            else:
-                # 払戻データ未取得時は最低払戻 ¥110 でカウント
-                total_returns += 110
-                wins += 1
-                no_payout_data += 1
-
-    n_races = len(races)
-    roi     = total_returns / total_bets * 100 if total_bets > 0 else 0
-    wr      = wins / n_races * 100 if n_races > 0 else 0
-    net     = total_returns - total_bets
-
-    title = label or f"コース{bet_course} {bet_type} 全賭け (¥{bet_amount}/race)"
-    print(f"【{title}】")
-    print(f"  対象レース数  : {n_races:,}")
-    print(f"  総賭け金      : ¥{total_bets:,}")
-    print(f"  的中数        : {wins} ({wr:.1f}%)")
-    print(f"  総払戻金      : ¥{total_returns:,}")
-    print(f"  損益          : ¥{net:+,}")
-    print(f"  回収率        : {roi:.1f}%")
-    if no_payout_data:
-        print(f"  ※ 払戻データ未取得 {no_payout_data} 件 → ¥110 で代替集計")
-    print()
-
-
-# ---------------------------------------------------------------------------
-# メイン
+# エントリーポイント
 # ---------------------------------------------------------------------------
 
 def main():
-    # 引数パース
     bet_amount = DEFAULT_BET
+    history_n  = 30
     db_path    = DB_PATH
-    args = sys.argv[1:]
-    i = 0
+
+    i, args = 0, sys.argv[1:]
     while i < len(args):
         if args[i] == "--bet" and i + 1 < len(args):
             bet_amount = int(args[i + 1]); i += 2
+        elif args[i] == "--history" and i + 1 < len(args):
+            history_n = int(args[i + 1]); i += 2
         else:
             db_path = Path(args[i]); i += 1
 
@@ -172,57 +398,67 @@ def main():
 
     conn = sqlite3.connect(db_path)
 
-    # データ件数確認
-    n_races = conn.execute("SELECT COUNT(*) FROM races").fetchone()[0]
+    n_races   = conn.execute("SELECT COUNT(*) FROM races").fetchone()[0]
     n_results = conn.execute("SELECT COUNT(*) FROM results").fetchone()[0]
-    date_range = conn.execute(
-        "SELECT MIN(date), MAX(date) FROM races"
-    ).fetchone()
+    n_entries = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+    dates     = conn.execute("SELECT MIN(date), MAX(date) FROM races").fetchone()
 
-    print("=" * 55)
-    print("  BOAT RACE バックテスト結果")
-    print("=" * 55)
-    print(f"  期間   : {date_range[0]} ～ {date_range[1]}")
-    print(f"  レース数: {n_races:,}")
-    print(f"  成績件数: {n_results:,}")
+    print("=" * 70)
+    print("  BOAT RACE バックテスト — 複合スコアリングモデル")
+    print("=" * 70)
+    print(f"  期間       : {dates[0]} ～ {dates[1]}")
+    print(f"  レース数   : {n_races:,}")
+    print(f"  成績件数   : {n_results:,}")
+    has_entries = n_entries > 0
+    print(f"  選手データ : {'あり (' + str(n_entries) + '件, B ファイル使用)' if has_entries else 'なし (コース・直近フォームのみ)'}")
+    print(f"  賭け金     : ¥{bet_amount}/点  直近フォーム: {history_n}走")
     print()
 
-    df = load_results(conn)
-    if df.empty:
-        sys.exit("成績データがありません。parse.py を再実行してください。")
-
-    # コース別勝率表示
-    print("── コース別 1着率 ─────────────────────────────")
-    stats = show_course_stats(df)
-
-    # 単勝払戻データ
-    df_tansho = load_payouts(conn, "単勝")
-    has_payout = not df_tansho.empty
-    if not has_payout:
-        print("  ※ 払戻データなし (T7 形式不一致の可能性) → 最低払戻 ¥110 で代替\n")
-
-    print("── 戦略シミュレーション ────────────────────────")
-
-    # 戦略1: コース1 単勝
-    run_backtest(df, df_tansho, bet_course=1, bet_amount=bet_amount)
-
-    # 戦略2: コース2 単勝
-    run_backtest(df, df_tansho, bet_course=2, bet_amount=bet_amount)
-
-    # 戦略3: コース3 単勝
-    run_backtest(df, df_tansho, bet_course=3, bet_amount=bet_amount)
-
-    # 戦略4: 最高勝率コース
-    best_course = int(stats["win_rate"].idxmax())
-    if best_course not in (1, 2, 3):
-        run_backtest(
-            df, df_tansho,
-            bet_course=best_course,
-            bet_amount=bet_amount,
-            label=f"コース{best_course} 単勝 (データ内最高勝率)",
-        )
-
+    engine = BacktestEngine(bet_amount=bet_amount, history_n=history_n)
+    engine.load(conn)
     conn.close()
+
+    df_results = engine.df_results
+
+    # ── スコアモデル特徴量 ──
+    print("── スコアモデル特徴量 ─────────────────────────────────────")
+    feats = [
+        ("当地勝率",      f"× {W_VENUE_WR}",  "B ファイル"),
+        ("全国勝率",      f"× {W_NAT_WR}",    "B ファイル"),
+        ("モーター偏差",  f"× {W_MOTOR}",     "B ファイル"),
+        ("コース係数",    f"× {W_COURSE}",    "常時"),
+        ("平均ST",        f"× {W_AVG_ST}",    "B ファイル"),
+        ("F回数",         f"× {W_FL}",        "B ファイル"),
+        (f"直近{history_n}走 1着率", f"× {W_RECENT_WIN}", "K ファイル蓄積"),
+        (f"直近{history_n}走 3着内率", f"× {W_RECENT_3RD}", "K ファイル蓄積"),
+    ]
+    for name, weight, src in feats:
+        used = "✓" if src == "常時" or (src == "B ファイル" and has_entries) else "─"
+        print(f"  {used}  {name:<20}  {weight:<8}  ({src})")
+    print()
+
+    # ── コース別1着率 ──
+    print("── コース別 1着率 ────────────────────────────────────────")
+    show_course_stats(df_results)
+
+    # ── バックテスト実行 ──
+    print("── 戦略別パフォーマンス ──────────────────────────────────")
+    stats = engine.run()
+    show_results(stats, bet_amount)
+    print()
+
+    # ── サマリー ──
+    valid = {k: v for k, v in stats.items() if v["bets"] > 0}
+    best_roi  = max(valid.items(), key=lambda x: x[1]["returns"] / x[1]["bets"])
+    best_name = best_roi[0].split("_", 1)[1]
+    best_r    = best_roi[1]["returns"] / best_roi[1]["bets"] * 100
+
+    print(f"── サマリー ──────────────────────────────────────────────")
+    print(f"  最高回収率: {best_name}  ({best_r:.1f}%)")
+    if not has_entries:
+        print("  ※ 選手データ (B ファイル) がないため、コース係数と直近フォームのみで採点しています。")
+        print("    B ファイルを含めて parse.py を再実行すると精度が向上します。")
+    print()
 
 
 if __name__ == "__main__":
