@@ -1,6 +1,6 @@
 __pycache__/
 *.pyc
 *.pyo
-data/
-*.db
+data/lzh/
+data/boatrace.db
 *.lzh
